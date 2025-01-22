@@ -88,6 +88,7 @@ export default class OpenRouterProvider extends BaseProvider {
       const data = (await response.json()) as OpenRouterModelsResponse;
 
       return data.data
+        .filter(m => m.pricing.prompt === 0 && m.pricing.completion === 0)
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((m) => ({
           name: m.id,
