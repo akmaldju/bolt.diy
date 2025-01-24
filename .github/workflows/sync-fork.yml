@@ -1,0 +1,108 @@
+name: Sync Fork via PR
+
+on:
+  schedule:
+    - cron: '0 * * * *' # Runs every hour - adjust as needed
+  workflow_dispatch: # Allows manual triggering from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout forked repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for accurate comparison
+
+      - name: Set up upstream remote
+        run: |
+          git remote add upstream ${{ github.event.repository.parent.clone_url }}
+          echo "Upstream remote URL: $(git remote get-url upstream)"
+
+      - name: Fetch upstream changes
+        run: git fetch upstream
+
+      - name: Get current branch name
+        id: branch-name
+        run: echo "BRANCH_NAME=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
+
+      - name: Check for differences
+        id: diff-check
+        run: |
+          if ! git diff --quiet ${{ steps.branch-name.outputs.BRANCH_NAME }} upstream/${{ steps.branch-name.outputs.BRANCH_NAME }}; then
+            echo "::set-output name=has_diff::true"
+          else
+            echo "::set-output name=has_diff::false"
+          fi
+
+      - name: Create Sync Branch
+        if: steps.diff-check.outputs.has_diff == 'true'
+        run: |
+          BRANCH_NAME="${{ steps.branch-name.outputs.BRANCH_NAME }}"
+          SYNC_BRANCH_NAME="sync-upstream-${BRANCH_NAME}-$(date +%Y%m%d-%H%M%S)" # Unique branch name
+          git checkout -b "${SYNC_BRANCH_NAME}"
+          git merge upstream/"${BRANCH_NAME}"
+          echo "Sync branch ${SYNC_BRANCH_NAME} created with upstream changes."
+          echo "SYNC_BRANCH_NAME=$SYNC_BRANCH_NAME" >> "$GITHUB_ENV" # Export for later steps
+
+      - name: Push Sync Branch
+        if: steps.diff-check.outputs.has_diff == 'true'
+        run: |
+          git push origin "${SYNC_BRANCH_NAME}"
+          echo "Sync branch pushed to origin."
+
+      - name: Check for Existing PR
+        if: steps.diff-check.outputs.has_diff == 'true'
+        id: check-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const syncBranch = process.env.SYNC_BRANCH_NAME;
+            const baseBranch = "${{ steps.branch-name.outputs.BRANCH_NAME }}";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            console.log(`Checking for existing PRs from ${syncBranch} to ${baseBranch} in ${owner}/${repo}`);
+
+            const pulls = await github.rest.pulls.list({
+              owner: owner,
+              repo: repo,
+              head: `${owner}:${syncBranch}`, // Check PRs from the sync branch
+              base: baseBranch,             // Targeting the base branch
+              state: 'open'                 // Only check open PRs
+            });
+
+            if (pulls.data.length > 0) {
+              console.log(`Existing PR found: ${pulls.data[0].html_url}`);
+              core.setOutput('pr_exists', 'true');
+            } else {
+              console.log('No existing PR found.');
+              core.setOutput('pr_exists', 'false');
+            }
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Pull Request
+        if: steps.diff-check.outputs.has_diff == 'true' && steps.check-pr.outputs.pr_exists != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const syncBranch = process.env.SYNC_BRANCH_NAME;
+            const baseBranch = "${{ steps.branch-name.outputs.BRANCH_NAME }}";
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            console.log(`Creating PR from ${syncBranch} to ${baseBranch} in ${owner}/${repo}`);
+
+            const pullRequest = await github.rest.pulls.create({
+              owner: owner,
+              repo: repo,
+              head: syncBranch,
+              base: baseBranch,
+              title: `Sync fork with upstream: ${baseBranch}`,
+              body: `This PR automatically syncs your fork with the latest changes from the upstream repository's '${baseBranch}' branch.`
+            });
+
+            console.log(`PR created: ${pullRequest.data.html_url}`);
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
