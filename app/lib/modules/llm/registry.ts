@@ -20,7 +20,7 @@ export {
   // CohereProvider,
   // DeepseekProvider,
   GoogleProvider,
-  // GroqProvider,
+  GroqProvider,
   HuggingFaceProvider,
   // HyperbolicProvider,
   MistralProvider,
