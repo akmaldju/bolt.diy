@@ -29,7 +29,7 @@ export {
   // OllamaProvider,
   // OpenAIProvider,
   OpenRouterProvider,
-  // OpenAILikeProvider,
+  OpenAILikeProvider,
   // PerplexityProvider,
   // XAIProvider,
   // TogetherProvider,
