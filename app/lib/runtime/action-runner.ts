@@ -1,7 +1,7 @@
-import { WebContainer } from '@webcontainer/api';
+import type { WebContainer } from '@webcontainer/api';
+import { path as nodePath } from '~/utils/path';
 import { atom, map, type MapStore } from 'nanostores';
-import * as nodePath from 'node:path';
-import type { ActionAlert, BoltAction } from '~/types/actions';
+import type { ActionAlert, BoltAction, FileHistory, SupabaseAction, SupabaseAlert } from '~/types/actions';
 import { createScopedLogger } from '~/utils/logger';
 import { unreachable } from '~/utils/unreachable';
 import type { ActionCallbackData } from './message-parser';
@@ -70,15 +70,19 @@ export class ActionRunner {
   runnerId = atom<string>(`${Date.now()}`);
   actions: ActionsMap = map({});
   onAlert?: (alert: ActionAlert) => void;
+  onSupabaseAlert?: (alert: SupabaseAlert) => void;
+  buildOutput?: { path: string; exitCode: number; output: string };
 
   constructor(
     webcontainerPromise: Promise<WebContainer>,
     getShellTerminal: () => BoltShell,
     onAlert?: (alert: ActionAlert) => void,
+    onSupabaseAlert?: (alert: SupabaseAlert) => void,
   ) {
     this.#webcontainer = webcontainerPromise;
     this.#shellTerminal = getShellTerminal;
     this.onAlert = onAlert;
+    this.onSupabaseAlert = onSupabaseAlert;
   }
 
   addAction(data: ActionCallbackData) {
@@ -154,6 +158,28 @@ export class ActionRunner {
         }
         case 'file': {
           await this.#runFileAction(action);
+          break;
+        }
+        case 'supabase': {
+          try {
+            await this.handleSupabaseAction(action as SupabaseAction);
+          } catch (error: any) {
+            // Update action status
+            this.#updateAction(actionId, {
+              status: 'failed',
+              error: error instanceof Error ? error.message : 'Supabase action failed',
+            });
+
+            // Return early without re-throwing
+            return;
+          }
+          break;
+        }
+        case 'build': {
+          const buildOutput = await this.#runBuildAction(action);
+
+          // Store build output for deployment
+          this.buildOutput = buildOutput;
           break;
         }
         case 'start': {
@@ -299,9 +325,120 @@ export class ActionRunner {
       logger.error('Failed to write file\n\n', error);
     }
   }
+
   #updateAction(id: string, newState: ActionStateUpdate) {
     const actions = this.actions.get();
 
     this.actions.setKey(id, { ...actions[id], ...newState });
+  }
+
+  async getFileHistory(filePath: string): Promise<FileHistory | null> {
+    try {
+      const webcontainer = await this.#webcontainer;
+      const historyPath = this.#getHistoryPath(filePath);
+      const content = await webcontainer.fs.readFile(historyPath, 'utf-8');
+
+      return JSON.parse(content);
+    } catch (error) {
+      logger.error('Failed to get file history:', error);
+      return null;
+    }
+  }
+
+  async saveFileHistory(filePath: string, history: FileHistory) {
+    // const webcontainer = await this.#webcontainer;
+    const historyPath = this.#getHistoryPath(filePath);
+
+    await this.#runFileAction({
+      type: 'file',
+      filePath: historyPath,
+      content: JSON.stringify(history),
+      changeSource: 'auto-save',
+    } as any);
+  }
+
+  #getHistoryPath(filePath: string) {
+    return nodePath.join('.history', filePath);
+  }
+
+  async #runBuildAction(action: ActionState) {
+    if (action.type !== 'build') {
+      unreachable('Expected build action');
+    }
+
+    const webcontainer = await this.#webcontainer;
+
+    // Create a new terminal specifically for the build
+    const buildProcess = await webcontainer.spawn('npm', ['run', 'build']);
+
+    let output = '';
+    buildProcess.output.pipeTo(
+      new WritableStream({
+        write(data) {
+          output += data;
+        },
+      }),
+    );
+
+    const exitCode = await buildProcess.exit;
+
+    if (exitCode !== 0) {
+      throw new ActionCommandError('Build Failed', output || 'No Output Available');
+    }
+
+    // Get the build output directory path
+    const buildDir = nodePath.join(webcontainer.workdir, 'dist');
+
+    return {
+      path: buildDir,
+      exitCode,
+      output,
+    };
+  }
+  async handleSupabaseAction(action: SupabaseAction) {
+    const { operation, content, filePath } = action;
+    logger.debug('[Supabase Action]:', { operation, filePath, content });
+
+    switch (operation) {
+      case 'migration':
+        if (!filePath) {
+          throw new Error('Migration requires a filePath');
+        }
+
+        // Show alert for migration action
+        this.onSupabaseAlert?.({
+          type: 'info',
+          title: 'Supabase Migration',
+          description: `Create migration file: ${filePath}`,
+          content,
+          source: 'supabase',
+        });
+
+        // Only create the migration file
+        await this.#runFileAction({
+          type: 'file',
+          filePath,
+          content,
+          changeSource: 'supabase',
+        } as any);
+        return { success: true };
+
+      case 'query': {
+        // Always show the alert and let the SupabaseAlert component handle connection state
+        this.onSupabaseAlert?.({
+          type: 'info',
+          title: 'Supabase Query',
+          description: 'Execute database query',
+          content,
+          source: 'supabase',
+        });
+
+        // The actual execution will be triggered from SupabaseChatAlert
+        return { pending: true };
+      }
+
+      default:
+        throw new Error(`Unknown operation: ${operation}`);
+    }
   }
 }
